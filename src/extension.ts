@@ -22,14 +22,21 @@ interface Token {
 }
 
 interface StringRange {
-  contentStart: number;
-  contentEnd: number;
+  start: number;
+  end: number;
   content: string;
 }
 
-// --- Decoration colors (light / dark theme) ---
+interface CallSite {
+  methodName: string;
+  nameOffset: number;
+  argsText: string;
+  argsStart: number;
+}
 
-const tokenColors: Record<TokenType, { light: string; dark: string }> = {
+// --- Decoration setup ---
+
+const TOKEN_COLORS: Record<TokenType, { light: string; dark: string }> = {
   keyword:     { light: "#0000FF", dark: "#569CD6" },
   function:    { light: "#795E26", dark: "#DCDCAA" },
   operator:    { light: "#383838", dark: "#D4D4D4" },
@@ -45,9 +52,9 @@ const tokenColors: Record<TokenType, { light: string; dark: string }> = {
 
 let decorationTypes: Map<TokenType, vscode.TextEditorDecorationType>;
 
-const createDecorationTypes = () =>
-  new Map(
-    Object.entries(tokenColors).map(([type, colors]) => [
+function createDecorationTypes(): Map<TokenType, vscode.TextEditorDecorationType> {
+  return new Map(
+    Object.entries(TOKEN_COLORS).map(([type, colors]) => [
       type as TokenType,
       vscode.window.createTextEditorDecorationType({
         light: { color: colors.light },
@@ -55,10 +62,11 @@ const createDecorationTypes = () =>
       }),
     ])
   );
+}
 
 // --- SQL tokenizer ---
 
-const keywords = [
+const KEYWORDS = [
   "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
   "CROSS", "ON", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
   "MERGE", "USING", "MATCHED", "UPSERT",
@@ -80,7 +88,7 @@ const keywords = [
   "LATERAL", "UNNEST", "TABLESAMPLE", "WITHIN", "GROUPING",
 ].join("|");
 
-const functions = [
+const FUNCTIONS = [
   "COUNT", "SUM", "AVG", "MIN", "MAX", "ARRAY_AGG", "STRING_AGG",
   "BOOL_AND", "BOOL_OR", "EVERY", "XMLAGG",
   "UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "SUBSTRING", "CONCAT",
@@ -105,7 +113,7 @@ const functions = [
   "EXISTS", "REPLACE",
 ].join("|");
 
-const types = [
+const TYPES = [
   "INT", "INTEGER", "SMALLINT", "BIGINT", "TINYINT",
   "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "MONEY",
   "VARCHAR", "NVARCHAR", "CHAR", "NCHAR", "TEXT", "NTEXT", "CLOB",
@@ -116,13 +124,13 @@ const types = [
   "JSON", "JSONB", "XML", "ARRAY",
 ].join("|");
 
-const tokenRegex = new RegExp(
-  `\\b(${keywords})\\b` +
-  `|\\b(${functions})(?=\\s*\\()` +
+const TOKEN_REGEX = new RegExp(
+  `\\b(${KEYWORDS})\\b` +
+  `|\\b(${FUNCTIONS})(?=\\s*\\()` +
   `|(<=|>=|<>|!=|!<|!>|::|\\|\\||&&|=|<|>|\\+|-|/|%)` +
   `|('(?:[^'\\\\]|\\\\.)*')` +
   `|(\\b[0-9]+(?:\\.[0-9]+)?\\b)` +
-  `|\\b(${types})\\b` +
+  `|\\b(${TYPES})\\b` +
   `|(\\b\\w+\\b)` +
   `|(\\*)` +
   `|([()])` +
@@ -131,23 +139,19 @@ const tokenRegex = new RegExp(
   "gi"
 );
 
-const groupToType: TokenType[] = [
+const GROUP_TO_TYPE: TokenType[] = [
   "keyword", "function", "operator", "string", "number",
   "type", "identifier", "star", "parenthesis", "comma", "dot",
 ];
 
-function tokenize(text: string): Token[] {
+function tokenize(sql: string): Token[] {
   const tokens: Token[] = [];
-  tokenRegex.lastIndex = 0;
+  TOKEN_REGEX.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = tokenRegex.exec(text)) !== null) {
+  while ((match = TOKEN_REGEX.exec(sql)) !== null) {
     for (let i = 1; i < match.length; i++) {
       if (match[i] !== undefined) {
-        tokens.push({
-          type: groupToType[i - 1],
-          start: match.index,
-          length: match[0].length,
-        });
+        tokens.push({ type: GROUP_TO_TYPE[i - 1], start: match.index, length: match[0].length });
         break;
       }
     }
@@ -155,119 +159,206 @@ function tokenize(text: string): Token[] {
   return tokens;
 }
 
-// --- C# string literal regex fragments ---
+// --- C# string literal parsing ---
 
 const RAW_STRING = '"""[\\s\\S]*?"""';
 const VERBATIM_STRING = '@"(?:[^"]|"")*"';
 const REGULAR_STRING = '"(?:[^"\\\\]|\\\\.)*"';
-const ANY_CSHARP_STRING = `${RAW_STRING}|${VERBATIM_STRING}|${REGULAR_STRING}`;
+const CSHARP_STRING = `${RAW_STRING}|${VERBATIM_STRING}|${REGULAR_STRING}`;
 
-// --- Find SQL strings in C# source ---
+function extractStringContent(raw: string, rawStart: number): StringRange | null {
+  let skip: number;
+  let trim: number;
+  if (raw.startsWith('"""'))    { skip = 3; trim = 3; }
+  else if (raw.startsWith('@"')) { skip = 2; trim = 1; }
+  else if (raw.startsWith('"'))  { skip = 1; trim = 1; }
+  else return null;
 
-function findStrings(text: string): StringRange[] {
-  const ranges: StringRange[] = [];
+  const start = rawStart + skip;
+  const end = rawStart + raw.length - trim;
+  if (end <= start) return null;
+  return { start, end, content: raw.slice(skip, -trim) };
+}
 
-  // Pattern 1: /*lang=sql*/ followed by a string literal
-  const commentMarker = new RegExp(
-    `\\/\\*\\s*lang\\s*=\\s*sql\\s*\\*\\/\\s*(${ANY_CSHARP_STRING})`, "g"
-  );
+// --- Call site detection ---
+
+const SKIP_NAMES = new Set([
+  "if", "while", "for", "foreach", "switch", "catch", "using",
+  "return", "typeof", "nameof", "sizeof", "throw", "await",
+  "lock", "when", "var", "class", "struct", "interface",
+  "enum", "delegate", "event", "namespace",
+]);
+
+const HAS_CSHARP_STRING = new RegExp(CSHARP_STRING);
+const CALL_SITE_PATTERN = new RegExp(
+  `(\\w+)\\s*(?:<[^>]*>)?\\s*\\(((?:${CSHARP_STRING}|[^)])*)\\)`, "g"
+);
+
+function findCallSites(text: string): CallSite[] {
+  const sites: CallSite[] = [];
+  CALL_SITE_PATTERN.lastIndex = 0;
+
   let m: RegExpExecArray | null;
-  while ((m = commentMarker.exec(text)) !== null) {
-    const raw = m[1];
-    const rawStart = m.index + m[0].length - raw.length;
-    const range = extractStringContent(raw, rawStart);
-    if (range) ranges.push(range);
+  while ((m = CALL_SITE_PATTERN.exec(text)) !== null) {
+    const methodName = m[1];
+    if (SKIP_NAMES.has(methodName)) continue;
+
+    const argsText = m[2];
+    if (!HAS_CSHARP_STRING.test(argsText)) continue;
+
+    sites.push({
+      methodName,
+      nameOffset: m.index,
+      argsText,
+      argsStart: m.index + m[0].length - argsText.length - 1,
+    });
   }
 
-  // Pattern 2: [StringSyntax("sql")] on method parameters → find call sites
-  const paramPattern =
-    /\[StringSyntax\("sql"\)\]\s*(?:\w+\s+)+?(\w+)\s*[,)]/g;
-  const methods = new Set<string>();
-  while ((m = paramPattern.exec(text)) !== null) {
-    const before = text.slice(0, m.index);
-    const methodMatch = before.match(/(\w+)\s*\([^)]*$/);
-    if (methodMatch) methods.add(methodMatch[1]);
-  }
+  return sites;
+}
 
-  for (const methodName of methods) {
-    const escaped = methodName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const callPattern = new RegExp(
-      `${escaped}\\s*\\(((?:${ANY_CSHARP_STRING}|[^)])*)\\)`, "g"
-    );
-    while ((m = callPattern.exec(text)) !== null) {
-      const argsText = m[1];
-      const argsStart = m.index + m[0].length - argsText.length - 1;
-
-      const stringInArgs = new RegExp(ANY_CSHARP_STRING, "g");
-      let sm: RegExpExecArray | null;
-      while ((sm = stringInArgs.exec(argsText)) !== null) {
-        const rawStart = argsStart + sm.index;
-        const range = extractStringContent(sm[0], rawStart);
-        if (range) ranges.push(range);
-      }
+function extractStringsFromSites(sites: CallSite[]): StringRange[] {
+  const ranges: StringRange[] = [];
+  for (const site of sites) {
+    const pattern = new RegExp(CSHARP_STRING, "g");
+    let sm: RegExpExecArray | null;
+    while ((sm = pattern.exec(site.argsText)) !== null) {
+      const range = extractStringContent(sm[0], site.argsStart + sm.index);
+      if (range) ranges.push(range);
     }
   }
-
   return ranges;
 }
 
-function extractStringContent(
-  raw: string,
-  rawStart: number
-): StringRange | null {
-  if (raw.startsWith('"""')) {
-    const contentStart = rawStart + 3;
-    const contentEnd = rawStart + raw.length - 3;
-    if (contentEnd <= contentStart) return null;
-    return { contentStart, contentEnd, content: raw.slice(3, -3) };
+// --- LSP-based [StringSyntax] resolution ---
+
+// Precise cache: "definitionUri#methodName" → has attribute
+const definitionCache = new Map<string, boolean>();
+// Fast cache: "methodName" → has attribute (used for instant sync re-render on text change)
+const methodNameCache = new Map<string, boolean>();
+let lspTimer: ReturnType<typeof setTimeout> | undefined;
+
+const STRINGSYNTAX_SQL = /\[StringSyntax\("[^"]*sql[^"]*"\)\]/i;
+
+async function resolveMethod(
+  doc: vscode.TextDocument,
+  nameOffset: number,
+  methodName: string,
+): Promise<boolean> {
+  const position = doc.positionAt(nameOffset);
+
+  let defs: (vscode.Location | vscode.LocationLink)[] | undefined;
+  try {
+    defs = await vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>(
+      "vscode.executeDefinitionProvider", doc.uri, position,
+    );
+  } catch {
+    return false;
   }
-  if (raw.startsWith('@"')) {
-    const contentStart = rawStart + 2;
-    const contentEnd = rawStart + raw.length - 1;
-    if (contentEnd <= contentStart) return null;
-    return { contentStart, contentEnd, content: raw.slice(2, -1) };
+  if (!defs || defs.length === 0) return false;
+
+  const def = defs[0];
+  const defUri = "targetUri" in def ? def.targetUri : def.uri;
+  const defRange = "targetRange" in def ? def.targetRange : def.range;
+  const cacheKey = `${defUri.toString()}#${methodName}`;
+
+  const cached = definitionCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  try {
+    const defDoc = await vscode.workspace.openTextDocument(defUri);
+    const defText = defDoc.getText();
+    const defOffset = defDoc.offsetAt(defRange.start);
+
+    const windowStart = Math.max(0, defOffset - 200);
+    const windowEnd = Math.min(defText.length, defOffset + 500);
+    const result = STRINGSYNTAX_SQL.test(defText.slice(windowStart, windowEnd));
+
+    definitionCache.set(cacheKey, result);
+    if (result) methodNameCache.set(methodName, true);
+    return result;
+  } catch {
+    definitionCache.set(cacheKey, false);
+    return false;
   }
-  if (raw.startsWith('"')) {
-    const contentStart = rawStart + 1;
-    const contentEnd = rawStart + raw.length - 1;
-    if (contentEnd <= contentStart) return null;
-    return { contentStart, contentEnd, content: raw.slice(1, -1) };
-  }
-  return null;
 }
 
-// --- Apply decorations ---
+function findStringsCached(text: string): StringRange[] {
+  if (methodNameCache.size === 0) return [];
+  return extractStringsFromSites(
+    findCallSites(text).filter((s) => methodNameCache.get(s.methodName)),
+  );
+}
 
-function updateDecorations(editor: vscode.TextEditor): void {
-  if (editor.document.languageId !== "csharp") return;
+async function findStringsLSP(editor: vscode.TextEditor): Promise<StringRange[]> {
+  const callSites = findCallSites(editor.document.getText());
+  if (callSites.length === 0) return [];
 
-  const text = editor.document.getText();
-  const strings = findStrings(text);
+  const resolved = await Promise.all(
+    callSites.map((s) => resolveMethod(editor.document, s.nameOffset, s.methodName)),
+  );
+  return extractStringsFromSites(callSites.filter((_, i) => resolved[i]));
+}
 
+// --- Decoration application ---
+
+function applyDecorations(editor: vscode.TextEditor, strings: StringRange[]): void {
   const rangesByType = new Map<TokenType, vscode.Range[]>();
-  for (const [type] of decorationTypes) {
-    rangesByType.set(type, []);
-  }
+  for (const [type] of decorationTypes) rangesByType.set(type, []);
 
   for (const str of strings) {
     for (const token of tokenize(str.content)) {
-      const absStart = str.contentStart + token.start;
+      const absStart = str.start + token.start;
       const startPos = editor.document.positionAt(absStart);
       const endPos = editor.document.positionAt(absStart + token.length);
-      rangesByType.get(token.type)?.push(new vscode.Range(startPos, endPos));
+      rangesByType.get(token.type)!.push(new vscode.Range(startPos, endPos));
     }
   }
 
   for (const [type, decType] of decorationTypes) {
-    editor.setDecorations(decType, rangesByType.get(type) ?? []);
+    editor.setDecorations(decType, rangesByType.get(type)!);
   }
+}
+
+function deduplicate(ranges: StringRange[]): StringRange[] {
+  const seen = new Set<string>();
+  return ranges.filter((r) => {
+    const key = `${r.start}:${r.end}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function scheduleLspPass(editor: vscode.TextEditor): void {
+  if (lspTimer) clearTimeout(lspTimer);
+  const version = editor.document.version;
+
+  lspTimer = setTimeout(async () => {
+    if (vscode.window.activeTextEditor !== editor) return;
+    if (editor.document.version !== version) return;
+
+    const lspStrings = await findStringsLSP(editor);
+    if (lspStrings.length === 0) return;
+    if (vscode.window.activeTextEditor !== editor) return;
+    if (editor.document.version !== version) return;
+
+    const cached = findStringsCached(editor.document.getText());
+    applyDecorations(editor, deduplicate([...cached, ...lspStrings]));
+  }, 300);
+}
+
+function updateDecorations(editor: vscode.TextEditor): void {
+  if (editor.document.languageId !== "csharp") return;
+
+  applyDecorations(editor, findStringsCached(editor.document.getText()));
+  scheduleLspPass(editor);
 }
 
 // --- Extension lifecycle ---
 
 export function activate(context: vscode.ExtensionContext): void {
   decorationTypes = createDecorationTypes();
-
   for (const decType of decorationTypes.values()) {
     context.subscriptions.push(decType);
   }
@@ -285,8 +376,18 @@ export function activate(context: vscode.ExtensionContext): void {
       if (editor && event.document === editor.document) {
         updateDecorations(editor);
       }
-    })
+    }),
+    vscode.workspace.onDidSaveTextDocument(() => {
+      definitionCache.clear();
+      methodNameCache.clear();
+      const editor = vscode.window.activeTextEditor;
+      if (editor && editor.document.languageId === "csharp") {
+        scheduleLspPass(editor);
+      }
+    }),
   );
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  if (lspTimer) clearTimeout(lspTimer);
+}
