@@ -1,0 +1,24 @@
+{
+  "name": "vscode-csharp-sql-highlighting",
+  "displayName": "C# SQL String Highlighting",
+  "description": "Syntax highlighting for SQL embedded in C# string literals",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:csharp"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}
